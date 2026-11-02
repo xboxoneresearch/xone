@@ -187,6 +187,16 @@ To fix that, there is a fork of [xpad](https://github.com/paroj/xpad) driver, ca
 has disabled support for Xbox One controllers, so it can coexist with `xone` driver. If you're using Xbox 360
 controllers, it is recommended to use it to replace the standard `xpad` driver.
 
+## Xbox One internal accessory radio
+
+- Marvell 88W8782U, driver `xone-marvell`
+- Supply 3.3 V, not 5 V USB
+- USB ID `1286:2040` before firmware download, `045e:02ce` after
+- Firmware `mv14u8782.bin`, installed as `/lib/firmware/xone_marvell_02ce.bin`
+- Firmware download by the driver at every power-up
+- Pairing: `echo 1 | sudo tee /sys/bus/usb/drivers/xone-marvell/*/pairing`
+- Hardware: [Xbox One Research Wiki: Wifi](https://xboxoneresearch.github.io/wiki/hardware/wifi/)
+
 ## Wireless pairing
 
 Xbox devices have to be paired to the wireless dongle. They will not automatically connect to the dongle if they have
