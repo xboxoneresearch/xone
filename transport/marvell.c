@@ -58,6 +58,7 @@ module_param_named(channel, xone_mrvl_channel, ushort, 0444);
 /* host command identifiers (mwifiex numbering where it exists) */
 #define XONE_MRVL_CMD_RET_BIT 0x8000
 #define XONE_MRVL_CMD_DOMAIN_INFO 0x005b
+#define XONE_MRVL_CMD_KEY_MATERIAL 0x005e
 #define XONE_MRVL_CMD_FUNC_INIT 0x00a9
 #define XONE_MRVL_CMD_MAC_CONTROL 0x0028
 #define XONE_MRVL_CMD_SYS_CONFIG 0x00b0
@@ -79,6 +80,13 @@ module_param_named(channel, xone_mrvl_channel, ushort, 0444);
 #define XONE_MRVL_TX_BUF_SIZE 2048
 #define XONE_MRVL_TLV_UAP_MAC 0x012b
 #define XONE_MRVL_TLV_COUNTRY 0x0007
+#define XONE_MRVL_TLV_KEY_MATERIAL 0x0100
+#define XONE_MRVL_TLV_STA_MAC 0x0120
+
+#define XONE_MRVL_KEY_TYPE_AES 2
+#define XONE_MRVL_KEY_INFO_UNICAST BIT(1)
+#define XONE_MRVL_KEY_INFO_ENABLED BIT(2)
+#define XONE_MRVL_KEY_LEN 16
 #define XONE_MRVL_MAX_TX_POWER_DBM 20
 
 enum xone_mrvl_dawn_type {
@@ -146,6 +154,20 @@ struct xone_mrvl_frame_hdr {
 
 #define XONE_MRVL_TX_HEADROOM \
 	(sizeof(struct xone_mrvl_txpd) + sizeof(struct xone_mrvl_frame_hdr))
+
+struct xone_mrvl_key_material {
+	__le16 action;
+	__le16 key_tlv_type;
+	__le16 key_tlv_len;
+	__le16 key_type;
+	__le16 key_info;
+	__le16 key_len;
+	u8 key[XONE_MRVL_KEY_LEN];
+	u8 key_index;
+	__le16 mac_tlv_type;
+	__le16 mac_tlv_len;
+	u8 mac[ETH_ALEN];
+} __packed;
 
 struct xone_mrvl_fw_block_hdr {
 	__le32 command;
@@ -520,9 +542,42 @@ static int xone_mrvl_submit_buffer(struct gip_adapter *adap,
 	return err;
 }
 
+static int xone_mrvl_set_encryption_key(struct gip_adapter *adap,
+					u8 *key, int len)
+{
+	struct xone_mrvl_client *client = dev_get_drvdata(&adap->dev);
+	struct xone_mrvl_key_material params = {};
+	int err;
+
+	if (len != XONE_MRVL_KEY_LEN)
+		return -EINVAL;
+
+	params.action = cpu_to_le16(XONE_MRVL_HOST_ACT_SET);
+	params.key_tlv_type = cpu_to_le16(XONE_MRVL_TLV_KEY_MATERIAL);
+	params.key_tlv_len = cpu_to_le16(offsetof(typeof(params), mac_tlv_type) -
+					 offsetof(typeof(params), key_type));
+	params.key_type = cpu_to_le16(XONE_MRVL_KEY_TYPE_AES);
+	params.key_info = cpu_to_le16(XONE_MRVL_KEY_INFO_ENABLED |
+				      XONE_MRVL_KEY_INFO_UNICAST);
+	params.key_len = cpu_to_le16(XONE_MRVL_KEY_LEN);
+	memcpy(params.key, key, XONE_MRVL_KEY_LEN);
+	params.mac_tlv_type = cpu_to_le16(XONE_MRVL_TLV_STA_MAC);
+	params.mac_tlv_len = cpu_to_le16(ETH_ALEN);
+	ether_addr_copy(params.mac, client->address);
+
+	err = xone_mrvl_command(client->mrvl, XONE_MRVL_CMD_KEY_MATERIAL,
+				XONE_MRVL_BSS_UAP, &params, sizeof(params),
+				NULL, 0);
+	dev_dbg(client->mrvl->dev, "%s: address=%pM, err=%d\n", __func__,
+		client->address, err);
+
+	return err < 0 ? err : 0;
+}
+
 static struct gip_adapter_ops xone_mrvl_adapter_ops = {
 	.get_buffer = xone_mrvl_get_buffer,
 	.submit_buffer = xone_mrvl_submit_buffer,
+	.set_encryption_key = xone_mrvl_set_encryption_key,
 };
 
 static struct xone_mrvl_client *
@@ -720,8 +775,11 @@ static void xone_mrvl_handle_80211(struct xone_mrvl *mrvl, u8 *frame,
 		return;
 
 	fc = hdr->frame_control;
-	if (!ieee80211_is_data(fc))
+	if (!ieee80211_is_data(fc)) {
+		print_hex_dump_debug("xone-marvell mgmt: ", DUMP_PREFIX_OFFSET,
+				     16, 1, frame, min(length, 64), false);
 		return;
+	}
 
 	if (ieee80211_has_a4(fc))
 		hdr_len += ETH_ALEN;
