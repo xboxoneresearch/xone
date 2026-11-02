@@ -65,6 +65,7 @@ module_param_named(channel, xone_mrvl_channel, ushort, 0444);
 #define XONE_MRVL_CMD_BSS_START 0x00b1
 #define XONE_MRVL_CMD_BSS_STOP 0x00b2
 #define XONE_MRVL_CMD_RECONFIG_TX_BUF 0x00d9
+#define XONE_MRVL_CMD_TXPWR_CFG 0x00d1
 #define XONE_MRVL_CMD_GET_HW_SPEC 0x0003
 #define XONE_MRVL_CMD_MAC_REG_ACCESS 0x0019
 #define XONE_MRVL_CMD_SUBSCRIBE_EVENT 0x0075
@@ -80,6 +81,7 @@ module_param_named(channel, xone_mrvl_channel, ushort, 0444);
 #define XONE_MRVL_TX_BUF_SIZE 2048
 #define XONE_MRVL_TLV_UAP_MAC 0x012b
 #define XONE_MRVL_TLV_COUNTRY 0x0007
+#define XONE_MRVL_TLV_POWER_GROUP 0x0154
 #define XONE_MRVL_TLV_KEY_MATERIAL 0x0100
 #define XONE_MRVL_TLV_STA_MAC 0x0120
 
@@ -440,8 +442,49 @@ static ssize_t pairing_store(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RW(pairing);
 
+static int xone_mrvl_set_tx_power(struct xone_mrvl *mrvl, s8 dbm);
+static int xone_mrvl_get_tx_power(struct xone_mrvl *mrvl, s8 *dbm);
+
+static ssize_t tx_power_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct xone_mrvl *mrvl = usb_get_intfdata(to_usb_interface(dev));
+	s8 dbm;
+	int err;
+
+	err = xone_mrvl_get_tx_power(mrvl, &dbm);
+	if (err)
+		return err;
+
+	return sysfs_emit(buf, "%d\n", dbm);
+}
+
+static ssize_t tx_power_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct xone_mrvl *mrvl = usb_get_intfdata(to_usb_interface(dev));
+	s8 dbm;
+	int err;
+
+	err = kstrtos8(buf, 10, &dbm);
+	if (err)
+		return err;
+
+	if (dbm < 0 || dbm > XONE_MRVL_MAX_TX_POWER_DBM)
+		return -ERANGE;
+
+	err = xone_mrvl_set_tx_power(mrvl, dbm);
+	if (err)
+		return err;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(tx_power);
+
 static struct attribute *xone_mrvl_attrs[] = {
 	&dev_attr_pairing.attr,
+	&dev_attr_tx_power.attr,
 	NULL,
 };
 
@@ -1028,6 +1071,89 @@ static int xone_mrvl_set_domain(struct xone_mrvl *mrvl, u8 channel)
 				NULL, 0);
 
 	return err < 0 ? err : 0;
+}
+
+struct xone_mrvl_power_group {
+	u8 modulation_class;
+	u8 first_rate;
+	u8 last_rate;
+	u8 power_step;
+	s8 power_min;
+	s8 power_max;
+	u8 ht_bandwidth;
+	u8 reserved;
+} __packed;
+
+struct xone_mrvl_txpwr_cfg {
+	__le16 action;
+	__le16 cfg_index;
+	__le32 mode;
+	__le16 tlv_type;
+	__le16 tlv_len;
+	struct xone_mrvl_power_group groups[4];
+} __packed;
+
+static int xone_mrvl_set_tx_power(struct xone_mrvl *mrvl, s8 dbm)
+{
+	/* DSSS, OFDM, HT20 and HT40 rates, as the console driver sets them */
+	static const u8 classes[][4] = {
+		{ 3, 0x00, 0x03, 0 },
+		{ 7, 0x00, 0x07, 0 },
+		{ 8, 0x00, 0x20, 0 },
+		{ 8, 0x00, 0x20, 1 },
+	};
+	struct xone_mrvl_txpwr_cfg params = {};
+	int i, err;
+
+	params.action = cpu_to_le16(XONE_MRVL_HOST_ACT_SET);
+	params.mode = cpu_to_le32(1);
+	params.tlv_type = cpu_to_le16(XONE_MRVL_TLV_POWER_GROUP);
+	params.tlv_len = cpu_to_le16(sizeof(params.groups));
+
+	for (i = 0; i < ARRAY_SIZE(params.groups); i++) {
+		params.groups[i].modulation_class = classes[i][0];
+		params.groups[i].first_rate = classes[i][1];
+		params.groups[i].last_rate = classes[i][2];
+		params.groups[i].ht_bandwidth = classes[i][3];
+		params.groups[i].power_min = dbm;
+		params.groups[i].power_max = dbm;
+	}
+
+	err = xone_mrvl_command(mrvl, XONE_MRVL_CMD_TXPWR_CFG,
+				XONE_MRVL_BSS_UAP, &params, sizeof(params),
+				NULL, 0);
+
+	return err < 0 ? err : 0;
+}
+
+/* reports the maximum power of the first (DSSS) rate group */
+static int xone_mrvl_get_tx_power(struct xone_mrvl *mrvl, s8 *dbm)
+{
+	struct xone_mrvl_txpwr_cfg *resp;
+	__le16 params[4] = {};
+	int len, err = 0;
+
+	resp = kzalloc(XONE_MRVL_LEN_IN, GFP_KERNEL);
+	if (!resp)
+		return -ENOMEM;
+
+	len = xone_mrvl_command(mrvl, XONE_MRVL_CMD_TXPWR_CFG,
+				XONE_MRVL_BSS_UAP, params, sizeof(params),
+				resp, XONE_MRVL_LEN_IN);
+	if (len < 0)
+		err = len;
+	else if (len < offsetof(typeof(*resp), groups[1]) ||
+		 le16_to_cpu(resp->tlv_type) != XONE_MRVL_TLV_POWER_GROUP ||
+		 le16_to_cpu(resp->tlv_len) < sizeof(resp->groups[0]) ||
+		 len < offsetof(typeof(*resp), groups) +
+		       le16_to_cpu(resp->tlv_len))
+		err = -EIO;
+	else
+		*dbm = resp->groups[0].power_max;
+
+	kfree(resp);
+
+	return err;
 }
 
 static int xone_mrvl_start_ap(struct xone_mrvl *mrvl)
