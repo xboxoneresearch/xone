@@ -225,6 +225,10 @@ struct xone_mrvl {
 	/* set during teardown; no new TX urbs are submitted afterwards */
 	bool stopping;
 
+	/* serializes key changes against clearing them at unload */
+	struct mutex key_lock;
+	bool keys_cleared;
+
 	/* serializes access to clients array */
 	spinlock_t clients_lock;
 	struct xone_mrvl_client *clients[XONE_MRVL_MAX_CLIENTS];
@@ -542,36 +546,57 @@ static int xone_mrvl_submit_buffer(struct gip_adapter *adap,
 	return err;
 }
 
-static int xone_mrvl_set_encryption_key(struct gip_adapter *adap,
-					u8 *key, int len)
+/* a NULL key removes the station key; the firmware keeps keys across FUNC_INIT */
+static int xone_mrvl_set_key(struct xone_mrvl *mrvl, const u8 *addr,
+			     const u8 *key)
 {
-	struct xone_mrvl_client *client = dev_get_drvdata(&adap->dev);
 	struct xone_mrvl_key_material params = {};
+	u16 info = XONE_MRVL_KEY_INFO_UNICAST;
 	int err;
 
-	if (len != XONE_MRVL_KEY_LEN)
-		return -EINVAL;
+	mutex_lock(&mrvl->key_lock);
+
+	/* no key may outlive the driver; the next load would find it */
+	if (key && mrvl->keys_cleared) {
+		mutex_unlock(&mrvl->key_lock);
+		return -ESHUTDOWN;
+	}
+
+	if (key) {
+		info |= XONE_MRVL_KEY_INFO_ENABLED;
+		memcpy(params.key, key, XONE_MRVL_KEY_LEN);
+	}
 
 	params.action = cpu_to_le16(XONE_MRVL_HOST_ACT_SET);
 	params.key_tlv_type = cpu_to_le16(XONE_MRVL_TLV_KEY_MATERIAL);
 	params.key_tlv_len = cpu_to_le16(offsetof(typeof(params), mac_tlv_type) -
 					 offsetof(typeof(params), key_type));
 	params.key_type = cpu_to_le16(XONE_MRVL_KEY_TYPE_AES);
-	params.key_info = cpu_to_le16(XONE_MRVL_KEY_INFO_ENABLED |
-				      XONE_MRVL_KEY_INFO_UNICAST);
+	params.key_info = cpu_to_le16(info);
 	params.key_len = cpu_to_le16(XONE_MRVL_KEY_LEN);
-	memcpy(params.key, key, XONE_MRVL_KEY_LEN);
 	params.mac_tlv_type = cpu_to_le16(XONE_MRVL_TLV_STA_MAC);
 	params.mac_tlv_len = cpu_to_le16(ETH_ALEN);
-	ether_addr_copy(params.mac, client->address);
+	ether_addr_copy(params.mac, addr);
 
-	err = xone_mrvl_command(client->mrvl, XONE_MRVL_CMD_KEY_MATERIAL,
+	err = xone_mrvl_command(mrvl, XONE_MRVL_CMD_KEY_MATERIAL,
 				XONE_MRVL_BSS_UAP, &params, sizeof(params),
 				NULL, 0);
-	dev_dbg(client->mrvl->dev, "%s: address=%pM, err=%d\n", __func__,
-		client->address, err);
+	mutex_unlock(&mrvl->key_lock);
+	dev_dbg(mrvl->dev, "%s: address=%pM, enabled=%d, err=%d\n", __func__,
+		addr, !!key, err);
 
 	return err < 0 ? err : 0;
+}
+
+static int xone_mrvl_set_encryption_key(struct gip_adapter *adap,
+					u8 *key, int len)
+{
+	struct xone_mrvl_client *client = dev_get_drvdata(&adap->dev);
+
+	if (len != XONE_MRVL_KEY_LEN)
+		return -EINVAL;
+
+	return xone_mrvl_set_key(client->mrvl, client->address, key);
 }
 
 static struct gip_adapter_ops xone_mrvl_adapter_ops = {
@@ -593,14 +618,30 @@ xone_mrvl_find_client(struct xone_mrvl *mrvl, const u8 *addr)
 	return NULL;
 }
 
+/* only teardown is fatal; a stale key at worst costs the controller a rejoin */
+static int xone_mrvl_clear_key(struct xone_mrvl *mrvl, const u8 *addr)
+{
+	int err = xone_mrvl_set_key(mrvl, addr, NULL);
+
+	if (err == -ESHUTDOWN)
+		return err;
+
+	if (err)
+		dev_warn(mrvl->dev, "%s: address=%pM, err=%d\n", __func__,
+			 addr, err);
+
+	return 0;
+}
+
 static int xone_mrvl_add_client(struct xone_mrvl *mrvl, const u8 *addr)
 {
 	struct xone_mrvl_client *client;
 	unsigned long flags;
-	int i;
+	int i, err;
 
+	/* a new association starts unencrypted, also for a known client */
 	if (xone_mrvl_find_client(mrvl, addr))
-		return 0;
+		return xone_mrvl_clear_key(mrvl, addr);
 
 	for (i = 0; i < XONE_MRVL_MAX_CLIENTS; i++)
 		if (!mrvl->clients[i])
@@ -608,6 +649,10 @@ static int xone_mrvl_add_client(struct xone_mrvl *mrvl, const u8 *addr)
 
 	if (i == XONE_MRVL_MAX_CLIENTS)
 		return -ENOSPC;
+
+	err = xone_mrvl_clear_key(mrvl, addr);
+	if (err)
+		return err;
 
 	client = kzalloc(sizeof(*client), GFP_KERNEL);
 	if (!client)
@@ -619,7 +664,7 @@ static int xone_mrvl_add_client(struct xone_mrvl *mrvl, const u8 *addr)
 	client->adapter = gip_create_adapter(mrvl->dev,
 					     &xone_mrvl_adapter_ops, 1);
 	if (IS_ERR(client->adapter)) {
-		int err = PTR_ERR(client->adapter);
+		err = PTR_ERR(client->adapter);
 
 		kfree(client);
 		return err;
@@ -1300,6 +1345,7 @@ static int xone_mrvl_probe(struct usb_interface *intf,
 	init_usb_anchor(&mrvl->urbs_out);
 	spin_lock_init(&mrvl->clients_lock);
 	mutex_init(&mrvl->pairing_lock);
+	mutex_init(&mrvl->key_lock);
 	INIT_DELAYED_WORK(&mrvl->pairing_work, xone_mrvl_pairing_timeout);
 
 	usb_set_intfdata(intf, mrvl);
@@ -1312,6 +1358,39 @@ static int xone_mrvl_probe(struct usb_interface *intf,
 		usb_set_intfdata(intf, NULL);
 
 	return err;
+}
+
+/*
+ * The firmware keeps station keys across FUNC_INIT. A key left behind for a
+ * controller that rejoins after a reload stops all data from it.
+ */
+static void xone_mrvl_clear_keys(struct xone_mrvl *mrvl)
+{
+	u8 addrs[XONE_MRVL_MAX_CLIENTS][ETH_ALEN];
+	unsigned long flags;
+	int i, err, count = 0;
+
+	mutex_lock(&mrvl->key_lock);
+	mrvl->keys_cleared = true;
+	mutex_unlock(&mrvl->key_lock);
+
+	/* clients added by queued association events are cleared as well */
+	flush_workqueue(mrvl->event_wq);
+
+	spin_lock_irqsave(&mrvl->clients_lock, flags);
+	for (i = 0; i < XONE_MRVL_MAX_CLIENTS; i++)
+		if (mrvl->clients[i])
+			ether_addr_copy(addrs[count++], mrvl->clients[i]->address);
+	spin_unlock_irqrestore(&mrvl->clients_lock, flags);
+
+	for (i = 0; i < count; i++) {
+		err = xone_mrvl_set_key(mrvl, addrs[i], NULL);
+		if (err) {
+			dev_warn(mrvl->dev, "%s: address=%pM, err=%d\n",
+				 __func__, addrs[i], err);
+			break;
+		}
+	}
 }
 
 static void xone_mrvl_disconnect(struct usb_interface *intf)
@@ -1334,9 +1413,11 @@ static void xone_mrvl_disconnect(struct usb_interface *intf)
 	 * sending to a running BSS, and once nothing reads the IN pipes the
 	 * firmware stalls until the next power cycle.
 	 */
-	if (mrvl->udev->state != USB_STATE_NOTATTACHED)
+	if (mrvl->udev->state != USB_STATE_NOTATTACHED) {
+		xone_mrvl_clear_keys(mrvl);
 		xone_mrvl_command(mrvl, XONE_MRVL_CMD_BSS_STOP,
 				  XONE_MRVL_BSS_UAP, NULL, 0, NULL, 0);
+	}
 
 	xone_mrvl_stop(mrvl);
 	usb_set_intfdata(intf, NULL);
