@@ -33,6 +33,7 @@ module_param_named(channel, xone_mrvl_channel, ushort, 0444);
 #define XONE_MRVL_PID_BOOT 0x2040
 #define XONE_MRVL_VID 0x045e
 #define XONE_MRVL_PID 0x02ce
+#define XONE_MRVL_FIRMWARE "xone_marvell_02ce.bin"
 
 #define XONE_MRVL_EP_CMD_OUT 0x01
 #define XONE_MRVL_EP_CMD_IN 0x81
@@ -1339,15 +1340,12 @@ static void xone_mrvl_fw_load(struct work_struct *work)
 {
 	struct xone_mrvl *mrvl = container_of(work, typeof(*mrvl), fw_work);
 	const struct firmware *fw;
-	char name[32];
 	int err;
 
-	snprintf(name, sizeof(name), "xone_marvell_%04x.bin", XONE_MRVL_PID);
-
-	err = request_firmware(&fw, name, mrvl->dev);
+	err = request_firmware(&fw, XONE_MRVL_FIRMWARE, mrvl->dev);
 	if (err) {
 		dev_err(mrvl->dev, "%s: request %s failed: %d\n",
-			__func__, name, err);
+			__func__, XONE_MRVL_FIRMWARE, err);
 		return;
 	}
 
@@ -1572,5 +1570,6 @@ static struct usb_driver xone_mrvl_driver = {
 module_usb_driver(xone_mrvl_driver);
 
 MODULE_DEVICE_TABLE(usb, xone_mrvl_id_table);
+MODULE_FIRMWARE(XONE_MRVL_FIRMWARE);
 MODULE_DESCRIPTION("xone Marvell 88W8782U accessory radio driver");
 MODULE_LICENSE("GPL");
